@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-aprs-lite.py v1.0.7
+aprs-lite.py v1.0.8
 """
-import re, subprocess, socket, time, math, sys as _sys
+import re, subprocess, socket, time, math, sys as _sys, threading
+from enum import Enum
+from dataclasses import dataclass, field as _field
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -15,6 +17,26 @@ CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
 LOG_MAX_LINES = 500
 _MSG_MAX      = 100
+_OUT_MAX      = 30
+
+# Délais entre tentatives (secondes) : immédiat, 30s, 60s, 120s, 120s
+_MSG_RETRY_DELAYS = [0, 30, 60, 120, 120]
+
+class MsgState(Enum):
+    PENDING  = "⏳"
+    ACKED    = "✓ ACK"
+    FAILED   = "✗ Echec"
+    REJECTED = "✗ REJ"
+
+@dataclass
+class TrackedMsg:
+    msg_id:    str
+    addressee: str
+    text:      str
+    state:     MsgState        = MsgState.PENDING
+    attempts:  int             = 0
+    created:   float           = _field(default_factory=time.monotonic)
+    acked_at:  float | None    = None
 
 _config_cache: dict = {}
 _config_mtime: float = 0.0
@@ -97,6 +119,38 @@ def kiss_port_open():
     try:
         s = socket.create_connection(("127.0.0.1", 8001), timeout=2); s.close(); return True
     except: return False
+
+def encode_aprs_message(addressee: str, text: str, msg_id: str) -> str:
+    return f":{addressee.upper().ljust(9)[:9]}:{text[:67]}{{{msg_id}"
+
+def encode_aprs_ack(addressee: str, msg_id: str) -> str:
+    return f":{addressee.upper().ljust(9)[:9]}:ack{msg_id}"
+
+def _aprs_is_server() -> str:
+    try:
+        m = re.search(r'^IGSERVER\s+(\S+)', DIREWOLF_CONF.read_text(), re.MULTILINE)
+        if m: return m.group(1)
+    except: pass
+    return "euro.aprs2.net"
+
+def send_aprs_is(info: str) -> tuple[bool, str]:
+    """Envoie un info-field APRS via connexion TCP directe à APRS-IS."""
+    cfg = load_config()
+    callsign = cfg.get("CALLSIGN", "N0CALL").strip()
+    passcode = cfg.get("PASSCODE", "0").strip()
+    server   = _aprs_is_server()
+    packet   = f"{callsign}>APRS,TCPIP*:{info}"
+    try:
+        with socket.create_connection((server, 14580), timeout=10) as s:
+            f = s.makefile("rb")
+            f.readline()  # bannière
+            s.sendall(f"user {callsign} pass {passcode} vers aprs-lite 1.0.8\r\n".encode())
+            f.readline()  # réponse login
+            s.sendall(f"{packet}\r\n".encode())
+            time.sleep(0.5)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 def send_beacon(packet):
     if not kiss_port_open(): return False, "Port KISS 8001 inaccessible"
@@ -181,9 +235,9 @@ def make_weather_packet(callsign, lat, lon, data):
 
 def make_packet():
     cfg = load_config()
-    callsign = cfg.get("CALLSIGN","F0CALL"); comment = cfg.get("COMMENT","Relais APRS")
+    callsign = cfg.get("CALLSIGN","F5ZVO"); comment = cfg.get("COMMENT","Relais APRS")
     try:
-        lat=float(cfg.get("LAT","48.8566")); lon=float(cfg.get("LON","2.3522"))
+        lat=float(cfg.get("LAT","42.9783")); lon=float(cfg.get("LON","-0.7493"))
         ld,lm=int(abs(lat)),(abs(lat)%1)*60; od,om=int(abs(lon)),(abs(lon)%1)*60
         ls=f"{ld:02d}{lm:05.2f}{'N' if lat>=0 else 'S'}"; os_=f"{od:03d}{om:05.2f}{'E' if lon>=0 else 'W'}"
         return f"{callsign}>APNW01,WIDE1-1:!{ls}/{os_}# {comment}"
@@ -254,10 +308,10 @@ class ConfigPanel(Static):
     def compose(self):
         cfg=load_config()
         yield Label("[bold]Configuration Direwolf[/]"); yield Rule()
-        yield Label("Indicatif (MYCALL)"); yield Input(value=cfg.get("CALLSIGN",""), id="cfg_callsign", placeholder="F0CALL")
+        yield Label("Indicatif (MYCALL)"); yield Input(value=cfg.get("CALLSIGN",""), id="cfg_callsign", placeholder="F5ZVO")
         yield Label("TXDELAY (x10ms)"); yield Input(value=cfg.get("TXDELAY","50"), id="cfg_txdelay", placeholder="50")
-        yield Label("Latitude decimale"); yield Input(value=cfg.get("LAT",""), id="cfg_lat", placeholder="48.8566")
-        yield Label("Longitude decimale"); yield Input(value=cfg.get("LON",""), id="cfg_lon", placeholder="2.3522")
+        yield Label("Latitude decimale"); yield Input(value=cfg.get("LAT",""), id="cfg_lat", placeholder="42.9783")
+        yield Label("Longitude decimale"); yield Input(value=cfg.get("LON",""), id="cfg_lon", placeholder="-0.7493")
         yield Label("Commentaire beacon"); yield Input(value=cfg.get("COMMENT",""), id="cfg_comment", placeholder="iGate/Digi ARPA")
         yield Label("ADEVICE ALSA"); yield Input(value=cfg.get("ADEVICE","plughw:AllInOneCable,0"), id="cfg_adevice")
         yield Label("PTT"); yield Input(value=cfg.get("PTT","CM108 /dev/hidraw0"), id="cfg_ptt")
@@ -679,27 +733,54 @@ class MapPanel(Static):
 
 # ── MessagesPanel ─────────────────────────────────────────────
 class MessagesPanel(Static):
-    """Messages APRS recus (type 'message', hors ACK/REJ)."""
+    """Messagerie APRS P2P : envoi, ack tracking, retry, réception."""
 
     def compose(self):
-        yield Label("[bold]Messages APRS recus[/]")
+        yield Label("[bold]Nouveau message[/]")
+        with Horizontal(id="msg_compose_row"):
+            yield Input(placeholder="A (ex: F0CALL-9)", id="msg_to", max_length=9)
+            yield Input(placeholder="Message (67 car. max)", id="msg_text", max_length=67)
+            yield Button("Envoyer", id="btn_msg_send", variant="primary")
+        yield Static("", id="msg_send_status")
         yield Rule()
-        yield Static("[dim]En attente de messages...[/]", id="msg_header")
-        yield DataTable(id="msg_table", zebra_stripes=True, cursor_type="row")
+        yield Label("[bold]Envoyés[/]", id="msg_out_label")
+        yield DataTable(id="msg_out_table", zebra_stripes=True, cursor_type="none")
+        yield Rule()
+        yield Label("[bold]Reçus[/]", id="msg_in_label")
+        yield DataTable(id="msg_in_table", zebra_stripes=True, cursor_type="row")
 
     def on_mount(self):
-        self.query_one("#msg_table", DataTable).add_columns("De", "A", "Message", "Recu il y a")
+        out = self.query_one("#msg_out_table", DataTable)
+        out.add_columns("N°", "A", "Message", "Statut", "Essais", "il y a")
+        inn = self.query_one("#msg_in_table", DataTable)
+        inn.add_columns("De", "A", "Message", "Reçu il y a")
 
-    def refresh_messages(self, messages: list) -> None:
-        try:
-            self.query_one("#msg_header", Static).update(
-                f"[dim]{len(messages)} message(s)[/]  [dim](sans ACK/REJ, plus recent en haut)[/]")
+    def refresh_messages(self, inbound: list, outbound: list) -> None:
+        # label reçus
+        try: self.query_one("#msg_in_label", Label).update(f"[bold]Reçus[/] [dim]({len(inbound)})[/]")
         except: pass
-        t = self.query_one("#msg_table", DataTable)
-        t.clear()
-        for mono, pkt in reversed(messages):
-            t.add_row((pkt.source or "?")[:9], (pkt.addressee or "?")[:9],
-                      (pkt.message_text or "")[:55], time_ago(mono))
+        inn = self.query_one("#msg_in_table", DataTable)
+        inn.clear()
+        for mono, pkt in reversed(inbound):
+            inn.add_row((pkt.source or "?")[:9], (pkt.addressee or "?")[:9],
+                        (pkt.message_text or "")[:55], time_ago(mono))
+        # label envoyés
+        try: self.query_one("#msg_out_label", Label).update(f"[bold]Envoyés[/] [dim]({len(outbound)})[/]")
+        except: pass
+        out = self.query_one("#msg_out_table", DataTable)
+        out.clear()
+        for tm in reversed(outbound):
+            state_style = {
+                MsgState.ACKED:    f"[green]{tm.state.value}[/]",
+                MsgState.FAILED:   f"[red]{tm.state.value}[/]",
+                MsgState.REJECTED: f"[red]{tm.state.value}[/]",
+            }.get(tm.state, f"[yellow]{tm.state.value}[/]")
+            out.add_row(tm.msg_id, tm.addressee, tm.text[:40], state_style,
+                        str(tm.attempts), time_ago(tm.created))
+
+    def set_send_status(self, msg: str) -> None:
+        try: self.query_one("#msg_send_status", Static).update(msg)
+        except: pass
 
 
 # ── Application principale ────────────────────────────────────
@@ -720,8 +801,13 @@ class APRSLiteApp(App):
     #map_header { margin-bottom: 1; color: #8899aa; }
     #map_canvas { height: 1fr; }
     MessagesPanel { padding: 1; overflow-y: auto; }
-    #msg_header { margin-bottom: 1; color: #8899aa; }
-    #msg_table { height: 1fr; }
+    #msg_compose_row { height: 3; margin-bottom: 1; }
+    #msg_compose_row Input { width: 1fr; margin-right: 1; }
+    #msg_compose_row #msg_to { max-width: 14; }
+    #msg_compose_row Button { width: 12; }
+    #msg_send_status { height: 1; color: #8899aa; margin-bottom: 1; }
+    #msg_out_table { height: 8; }
+    #msg_in_table { height: 1fr; }
     """
     BINDINGS = [
         Binding("q","detach","Detacher"), Binding("x","quit","Quitter"), Binding("b","send_beacon","Beacon"),
@@ -732,6 +818,7 @@ class APRSLiteApp(App):
     _stopping=False; _journal_proc=None; _sensor_obj=None
     _station_tracker=None; _dedup=None; _stations_dirty=False
     _aprs_messages=[]; _messages_dirty=False; _own_lat=None; _own_lon=None
+    _msg_tracked={}; _msg_next_id=1; _msg_dirty=False; _msg_lock=None
 
     def compose(self):
         yield Header(show_clock=True)
@@ -766,8 +853,11 @@ class APRSLiteApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = "APRS-AIOC-RELAY-LITE v1.0.7"
+        self.title = "APRS-AIOC-RELAY-LITE v1.0.8"
         self._aprs_messages = []
+        self._msg_tracked   = {}
+        self._msg_next_id   = 1
+        self._msg_lock      = threading.Lock()
         self._init_stations()
         self._poll_status(); self._follow_journal(); self._run_aioc_detect(); self._sensor_worker()
         self.set_interval(10, self._refresh_panels)
@@ -795,14 +885,17 @@ class APRSLiteApp(App):
 
         # Stations + Messages : seulement si nouvelles données
         if (self._station_tracker.count > 0 or self._stations_dirty
-                or self._messages_dirty or self._aprs_messages):
+                or self._messages_dirty or self._aprs_messages or self._msg_dirty):
             self._stations_dirty = False; self._messages_dirty = False
+            self._msg_dirty = False
             try:
                 self.query_one("#stations_panel", StationsPanel).refresh_table(stns)
             except Exception: pass
             try:
+                with self._msg_lock:
+                    outbound = list(self._msg_tracked.values())
                 self.query_one("#messages_panel", MessagesPanel).refresh_messages(
-                    self._aprs_messages)
+                    self._aprs_messages, outbound)
             except Exception: pass
 
         # Carte : toujours si la position propre est connue (fond géo + croix)
@@ -868,13 +961,36 @@ class APRSLiteApp(App):
                                         if self._station_tracker:
                                             self._station_tracker.update(pkt)
                                             self._stations_dirty = True
-                                        if (pkt.info_type == "message"
-                                                and not pkt.is_ack and not pkt.is_rej
-                                                and pkt.message_text):
-                                            self._aprs_messages.append((time.monotonic(), pkt))
-                                            if len(self._aprs_messages) > _MSG_MAX:
-                                                self._aprs_messages = self._aprs_messages[-_MSG_MAX:]
-                                            self._messages_dirty = True
+                                        if pkt.info_type == "message":
+                                            # ACK pour un de nos messages sortants
+                                            if pkt.is_ack and pkt.message_id and self._msg_lock:
+                                                with self._msg_lock:
+                                                    tm = self._msg_tracked.get(pkt.message_id)
+                                                    if tm and tm.state == MsgState.PENDING:
+                                                        tm.state    = MsgState.ACKED
+                                                        tm.acked_at = time.monotonic()
+                                                self._msg_dirty = True
+                                            # REJ pour un de nos messages sortants
+                                            elif pkt.is_rej and pkt.message_id and self._msg_lock:
+                                                with self._msg_lock:
+                                                    tm = self._msg_tracked.get(pkt.message_id)
+                                                    if tm and tm.state == MsgState.PENDING:
+                                                        tm.state = MsgState.REJECTED
+                                                self._msg_dirty = True
+                                            # Message reçu adressé à nous → auto-ack + stockage
+                                            elif not pkt.is_ack and not pkt.is_rej and pkt.message_text:
+                                                cfg = load_config()
+                                                mycall = cfg.get("CALLSIGN","").strip().upper()
+                                                if mycall and (pkt.addressee or "").strip().upper() == mycall:
+                                                    if pkt.message_id and pkt.source:
+                                                        ack_info = encode_aprs_ack(pkt.source, pkt.message_id)
+                                                        threading.Thread(
+                                                            target=send_aprs_is, args=(ack_info,), daemon=True
+                                                        ).start()
+                                                self._aprs_messages.append((time.monotonic(), pkt))
+                                                if len(self._aprs_messages) > _MSG_MAX:
+                                                    self._aprs_messages = self._aprs_messages[-_MSG_MAX:]
+                                                self._messages_dirty = True
                                 except Exception: pass
 
                     if not self._stopping:
@@ -1012,11 +1128,80 @@ class APRSLiteApp(App):
             try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_tx_status, msg)
             except: pass
 
+    def _send_message(self, addressee: str, text: str) -> None:
+        if not addressee or not text: return
+        if self._msg_lock is None: return
+        with self._msg_lock:
+            msg_id = str(self._msg_next_id)
+            self._msg_next_id += 1
+            tm = TrackedMsg(msg_id=msg_id, addressee=addressee.upper(), text=text)
+            self._msg_tracked[msg_id] = tm
+            if len(self._msg_tracked) > _OUT_MAX:
+                oldest = next(iter(self._msg_tracked))
+                del self._msg_tracked[oldest]
+        self._msg_dirty = True
+        self._msg_retry_worker(msg_id)
+
+    @work(thread=True)
+    def _msg_retry_worker(self, msg_id: str) -> None:
+        """Envoie et réessaie un message APRS jusqu'à ACK ou épuisement."""
+        for attempt, delay in enumerate(_MSG_RETRY_DELAYS):
+            if delay > 0:
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline and not self._stopping:
+                    # Vérifier si déjà ACKé/REJeté
+                    if self._msg_lock:
+                        with self._msg_lock:
+                            tm = self._msg_tracked.get(msg_id)
+                            if tm and tm.state != MsgState.PENDING:
+                                return
+                    time.sleep(1)
+
+            if self._stopping: return
+            if self._msg_lock is None: return
+            with self._msg_lock:
+                tm = self._msg_tracked.get(msg_id)
+                if tm is None or tm.state != MsgState.PENDING:
+                    return
+                tm.attempts += 1
+                addressee, text = tm.addressee, tm.text
+
+            info = encode_aprs_message(addressee, text, msg_id)
+            ok, err = send_aprs_is(info)
+            self._msg_dirty = True
+
+            status = f"[dim]#{msg_id} → {addressee} : {'envoyé' if ok else 'erreur: ' + err} (essai {attempt+1}/{len(_MSG_RETRY_DELAYS)})[/]"
+            try:
+                self.call_from_thread(
+                    self.query_one("#messages_panel", MessagesPanel).set_send_status, status)
+            except Exception: pass
+
+        # Tous les essais épuisés
+        if self._msg_lock:
+            with self._msg_lock:
+                tm = self._msg_tracked.get(msg_id)
+                if tm and tm.state == MsgState.PENDING:
+                    tm.state = MsgState.FAILED
+        self._msg_dirty = True
+
     def on_button_pressed(self, event):
         bid=event.button.id
         if bid=="btn_beacon": self.action_send_beacon()
         elif bid=="btn_restart": self.action_restart_direwolf()
         elif bid=="btn_detect": self._do_detect_aioc()
+        elif bid=="btn_msg_send":
+            try:
+                panel = self.query_one("#messages_panel", MessagesPanel)
+                to_inp  = panel.query_one("#msg_to",   Input)
+                txt_inp = panel.query_one("#msg_text",  Input)
+                to_val  = to_inp.value.strip().upper()
+                txt_val = txt_inp.value.strip()
+                if to_val and txt_val:
+                    to_inp.value = ""; txt_inp.value = ""
+                    self._send_message(to_val, txt_val)
+                else:
+                    panel.set_send_status("[red]Remplissez le destinataire et le message.[/]")
+            except Exception: pass
 
     def action_send_beacon(self):
         packet=make_packet(); ok,err=send_beacon(packet)
