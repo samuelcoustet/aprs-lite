@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+config.env
+direwolf.conf
+geodata/
+logs/
+backups/
+*.bak*
+*.bak
