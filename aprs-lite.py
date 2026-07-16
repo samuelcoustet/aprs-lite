@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aprs-lite.py v1.0.9
+aprs-lite.py v1.0.10
 """
 import re, subprocess, socket, time, math, sys as _sys, threading, sqlite3
 from enum import Enum
@@ -227,6 +227,75 @@ def _chat_set_status(row_id: int, status: str):
     try:
         with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
             conn.execute("UPDATE chat_messages SET status=? WHERE id=?", (status, row_id))
+    except Exception:
+        pass
+
+def _telemetry_insert(bme_data: dict, box_data: dict | None = None):
+    """Insère une ligne de telemetry dans sidecar.db (capteur + système)."""
+    if not SIDECAR_DB.exists():
+        return
+    try:
+        # CPU température numérique
+        cpu_temp = None
+        try:
+            cpu_temp = int(Path('/sys/class/thermal/thermal_zone0/temp').read_text().strip()) / 1000
+        except Exception:
+            pass
+        # CPU usage
+        cpu_usage = None
+        try:
+            r = subprocess.run(["top", "-bn1"], capture_output=True, text=True, timeout=3)
+            for line in r.stdout.splitlines():
+                if "Cpu" in line or "cpu" in line:
+                    m = re.search(r'(\d+\.\d+)\s+id', line)
+                    if m:
+                        cpu_usage = round(100.0 - float(m.group(1)), 1)
+                    break
+        except Exception:
+            pass
+        # RAM usage %
+        ram_usage = None
+        try:
+            mem = {}
+            for line in Path('/proc/meminfo').read_text().splitlines():
+                k, _, v = line.partition(':')
+                mem[k.strip()] = int(v.split()[0])
+            total = mem.get('MemTotal', 0)
+            if total:
+                ram_usage = round((total - mem.get('MemAvailable', 0)) * 100 / total, 1)
+        except Exception:
+            pass
+        # Disk usage %
+        disk_usage = None
+        try:
+            r = subprocess.run(["df", "/"], capture_output=True, text=True, timeout=3)
+            lines = r.stdout.splitlines()
+            if len(lines) > 1:
+                disk_usage = float(lines[1].split()[4].rstrip('%'))
+        except Exception:
+            pass
+        # Load avg
+        load_avg = None
+        try:
+            load_avg = round(float(Path('/proc/loadavg').read_text().split()[0]), 2)
+        except Exception:
+            pass
+
+        now = datetime.now(_tz.utc).isoformat()
+        row = (
+            now, cpu_temp, cpu_usage, ram_usage, disk_usage, "", load_avg,
+            bme_data.get("temperature"), bme_data.get("humidity"), bme_data.get("pressure"),
+            box_data.get("temperature") if box_data else None,
+            box_data.get("humidity")    if box_data else None,
+            box_data.get("pressure")    if box_data else None,
+        )
+        with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO telemetry (timestamp,cpu_temp,cpu_usage,ram_usage,disk_usage,"
+                "direwolf_status,load_avg_1m,bme_temp,bme_humidity,bme_pressure,"
+                "box_temp,box_humidity,box_pressure) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row,
+            )
     except Exception:
         pass
 
@@ -931,7 +1000,7 @@ class APRSLiteApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = "APRS-AIOC-RELAY-LITE v1.0.9"
+        self.title = "APRS-AIOC-RELAY-LITE v1.0.10"
         self._aprs_messages = []
         self._msg_tracked   = {}
         self._msg_next_id   = 1
@@ -1164,6 +1233,23 @@ class APRSLiteApp(App):
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_error, str(e))
                     except: pass
                     time.sleep(60); continue
+            # Lecture capteur boîtier (0x77) pour telemetry DB
+            box_data = None
+            try:
+                import smbus2 as _smbus2
+                from bme_sensor import BME280 as _BME280, BME280_ID as _BME280_ID, CHIP_ID_REG as _CID_REG
+                _bus = _smbus2.SMBus(1)
+                try:
+                    _cid = _bus.read_byte_data(0x77, _CID_REG)
+                    _bus.close()
+                    if _cid == _BME280_ID:
+                        _s = _BME280(0x77); box_data = _s.read(); _s.close()
+                except Exception:
+                    try: _bus.close()
+                    except: pass
+            except Exception:
+                pass
+
             try:
                 data = sensor.read()
                 if data is not None:
@@ -1171,6 +1257,10 @@ class APRSLiteApp(App):
                     ts = time.strftime("%H:%M:%S")
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).update_sensor, data, chip, ts)
                     except: pass
+                    # Stocker telemetry dans la DB partagée
+                    threading.Thread(
+                        target=_telemetry_insert, args=(data, box_data), daemon=True
+                    ).start()
                     if cfg.get("SENSOR_TX_APRS","1") == "1":
                         self._wx_send_from_thread(data)
                 elif "BSEC" in chip and not self._stopping:
