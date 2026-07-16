@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-aprs-lite.py v1.0.8
+aprs-lite.py v1.0.9
 """
-import re, subprocess, socket, time, math, sys as _sys, threading
+import re, subprocess, socket, time, math, sys as _sys, threading, sqlite3
 from enum import Enum
 from dataclasses import dataclass, field as _field
 from pathlib import Path
+from datetime import datetime, timezone as _tz
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (Header, Footer, Static, Button, Label, Input, Log,
@@ -15,6 +16,7 @@ from textual import work
 
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
+SIDECAR_DB    = Path("/home/pi/aprs-sidecar-dashboard/data/sidecar.db")
 LOG_MAX_LINES = 500
 _MSG_MAX      = 100
 _OUT_MAX      = 30
@@ -37,6 +39,7 @@ class TrackedMsg:
     attempts:  int             = 0
     created:   float           = _field(default_factory=time.monotonic)
     acked_at:  float | None    = None
+    row_id:    int             = 0   # ID dans chat_messages (sidecar DB)
 
 _config_cache: dict = {}
 _config_mtime: float = 0.0
@@ -126,6 +129,22 @@ def encode_aprs_message(addressee: str, text: str, msg_id: str) -> str:
 def encode_aprs_ack(addressee: str, msg_id: str) -> str:
     return f":{addressee.upper().ljust(9)[:9]}:ack{msg_id}"
 
+def _encode_msg_packet(callsign: str, addressee: str, text: str, msg_id: str, via: str = "rf") -> str:
+    """Retourne un paquet APRS complet (RF ou IS)."""
+    dst_pad = addressee.upper().ljust(9)
+    if via == "rf":
+        return f"{callsign.upper()}>APRS,WIDE1-1::{dst_pad}:{text[:67]}{{{msg_id}"
+    else:
+        return f"{callsign.upper()}>APNW01,TCPIP*::{dst_pad}:{text[:67]}{{{msg_id}"
+
+def _encode_ack_packet(callsign: str, addressee: str, msg_id: str, via: str = "is") -> str:
+    """Retourne un paquet ACK complet."""
+    dst_pad = addressee.upper().ljust(9)
+    if via == "rf":
+        return f"{callsign.upper()}>APRS,WIDE1-1::{dst_pad}:ack{msg_id}"
+    else:
+        return f"{callsign.upper()}>APNW01,TCPIP*::{dst_pad}:ack{msg_id}"
+
 def _aprs_is_server() -> str:
     try:
         m = re.search(r'^IGSERVER\s+(\S+)', DIREWOLF_CONF.read_text(), re.MULTILINE)
@@ -133,24 +152,83 @@ def _aprs_is_server() -> str:
     except: pass
     return "euro.aprs2.net"
 
-def send_aprs_is(info: str) -> tuple[bool, str]:
-    """Envoie un info-field APRS via connexion TCP directe à APRS-IS."""
-    cfg = load_config()
-    callsign = cfg.get("CALLSIGN", "N0CALL").strip()
-    passcode = cfg.get("PASSCODE", "0").strip()
-    server   = _aprs_is_server()
-    packet   = f"{callsign}>APRS,TCPIP*:{info}"
+def _send_packet_is(packet: str, callsign: str, passcode: str, server: str) -> tuple[bool, str]:
+    """Envoie un paquet APRS complet via TCP APRS-IS."""
     try:
         with socket.create_connection((server, 14580), timeout=10) as s:
             f = s.makefile("rb")
             f.readline()  # bannière
-            s.sendall(f"user {callsign} pass {passcode} vers aprs-lite 1.0.8\r\n".encode())
+            s.sendall(f"user {callsign} pass {passcode} vers aprs-lite 1.0.9\r\n".encode())
             f.readline()  # réponse login
             s.sendall(f"{packet}\r\n".encode())
             time.sleep(0.5)
         return True, ""
     except Exception as e:
         return False, str(e)
+
+def send_aprs_is(info: str) -> tuple[bool, str]:
+    """Compat: envoie un info-field via IS (utilisé pour ACK auto inbound)."""
+    cfg = load_config()
+    callsign = cfg.get("CALLSIGN", "N0CALL").strip()
+    passcode = cfg.get("PASSCODE", "0").strip()
+    server   = _aprs_is_server()
+    packet   = f"{callsign.upper()}>APNW01,TCPIP*:{info}"
+    return _send_packet_is(packet, callsign, passcode, server)
+
+def _send_msg_rf_is(callsign: str, passcode: str, server: str,
+                    addressee: str, text: str, msg_id: str) -> tuple[bool, str, str]:
+    """RF-first (kissutil WIDE1-1), fallback IS. Retourne (ok, err, via)."""
+    packet_rf = _encode_msg_packet(callsign, addressee, text, msg_id, via="rf")
+    ok, err = send_beacon(packet_rf)
+    if ok:
+        return True, "", "rf"
+    packet_is = _encode_msg_packet(callsign, addressee, text, msg_id, via="is")
+    ok, err = _send_packet_is(packet_is, callsign, passcode, server)
+    return ok, err, "is"
+
+# --- DB partagée sidecar (écriture directe sqlite3, sans importer db.py) ---
+
+def _chat_insert(direction: str, src: str, dst: str, text: str, msg_no: str, via: str = "rf") -> int:
+    """Insère dans chat_messages de la sidecar DB. Retourne row_id ou 0 si DB absente."""
+    if not SIDECAR_DB.exists():
+        return 0
+    try:
+        now = datetime.now(_tz.utc).isoformat()
+        status = "pending" if direction == "out" else "in"
+        with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+            cur = conn.execute(
+                "INSERT INTO chat_messages (timestamp,direction,src,dst,text,msg_no,via,status)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (now, direction, src.upper(), dst.upper(), text, msg_no, via, status),
+            )
+            return cur.lastrowid or 0
+    except Exception:
+        return 0
+
+def _chat_ack(src: str, msg_no: str):
+    """Marque un message sortant comme ACKé dans la sidecar DB."""
+    if not SIDECAR_DB.exists():
+        return
+    try:
+        now = datetime.now(_tz.utc).isoformat()
+        with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+            conn.execute(
+                "UPDATE chat_messages SET acked=1, ack_at=?, status='acked'"
+                " WHERE dst=? AND msg_no=? AND direction='out'",
+                (now, src.upper(), msg_no),
+            )
+    except Exception:
+        pass
+
+def _chat_set_status(row_id: int, status: str):
+    """Met à jour le statut d'un message dans la sidecar DB."""
+    if not SIDECAR_DB.exists() or not row_id:
+        return
+    try:
+        with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+            conn.execute("UPDATE chat_messages SET status=? WHERE id=?", (status, row_id))
+    except Exception:
+        pass
 
 def send_beacon(packet):
     if not kiss_port_open(): return False, "Port KISS 8001 inaccessible"
@@ -853,7 +931,7 @@ class APRSLiteApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = "APRS-AIOC-RELAY-LITE v1.0.8"
+        self.title = "APRS-AIOC-RELAY-LITE v1.0.9"
         self._aprs_messages = []
         self._msg_tracked   = {}
         self._msg_next_id   = 1
@@ -969,6 +1047,11 @@ class APRSLiteApp(App):
                                                     if tm and tm.state == MsgState.PENDING:
                                                         tm.state    = MsgState.ACKED
                                                         tm.acked_at = time.monotonic()
+                                                        threading.Thread(
+                                                            target=_chat_ack,
+                                                            args=(pkt.source or "", pkt.message_id),
+                                                            daemon=True,
+                                                        ).start()
                                                 self._msg_dirty = True
                                             # REJ pour un de nos messages sortants
                                             elif pkt.is_rej and pkt.message_id and self._msg_lock:
@@ -976,8 +1059,13 @@ class APRSLiteApp(App):
                                                     tm = self._msg_tracked.get(pkt.message_id)
                                                     if tm and tm.state == MsgState.PENDING:
                                                         tm.state = MsgState.REJECTED
+                                                        threading.Thread(
+                                                            target=_chat_set_status,
+                                                            args=(tm.row_id, "rejected"),
+                                                            daemon=True,
+                                                        ).start()
                                                 self._msg_dirty = True
-                                            # Message reçu adressé à nous → auto-ack + stockage
+                                            # Message reçu adressé à nous → auto-ack + stockage DB
                                             elif not pkt.is_ack and not pkt.is_rej and pkt.message_text:
                                                 cfg = load_config()
                                                 mycall = cfg.get("CALLSIGN","").strip().upper()
@@ -987,6 +1075,13 @@ class APRSLiteApp(App):
                                                         threading.Thread(
                                                             target=send_aprs_is, args=(ack_info,), daemon=True
                                                         ).start()
+                                                    # Stocker en DB partagée
+                                                    threading.Thread(
+                                                        target=_chat_insert,
+                                                        args=("in", pkt.source or "", mycall,
+                                                              pkt.message_text, pkt.message_id or "", "rf"),
+                                                        daemon=True,
+                                                    ).start()
                                                 self._aprs_messages.append((time.monotonic(), pkt))
                                                 if len(self._aprs_messages) > _MSG_MAX:
                                                     self._aprs_messages = self._aprs_messages[-_MSG_MAX:]
@@ -1131,10 +1226,14 @@ class APRSLiteApp(App):
     def _send_message(self, addressee: str, text: str) -> None:
         if not addressee or not text: return
         if self._msg_lock is None: return
+        cfg = load_config()
+        mycall = cfg.get("CALLSIGN", "N0CALL").strip().upper()
         with self._msg_lock:
             msg_id = str(self._msg_next_id)
             self._msg_next_id += 1
             tm = TrackedMsg(msg_id=msg_id, addressee=addressee.upper(), text=text)
+            # Stockage immédiat en DB partagée (status=pending, via=? sera mis à jour)
+            tm.row_id = _chat_insert("out", mycall, addressee, text, msg_id, via="rf")
             self._msg_tracked[msg_id] = tm
             if len(self._msg_tracked) > _OUT_MAX:
                 oldest = next(iter(self._msg_tracked))
@@ -1144,12 +1243,16 @@ class APRSLiteApp(App):
 
     @work(thread=True)
     def _msg_retry_worker(self, msg_id: str) -> None:
-        """Envoie et réessaie un message APRS jusqu'à ACK ou épuisement."""
+        """Envoie et réessaie un message APRS jusqu'à ACK ou épuisement (RF-first)."""
+        cfg = load_config()
+        callsign = cfg.get("CALLSIGN", "N0CALL").strip().upper()
+        passcode = cfg.get("PASSCODE", "0").strip()
+        server   = _aprs_is_server()
+
         for attempt, delay in enumerate(_MSG_RETRY_DELAYS):
             if delay > 0:
                 deadline = time.monotonic() + delay
                 while time.monotonic() < deadline and not self._stopping:
-                    # Vérifier si déjà ACKé/REJeté
                     if self._msg_lock:
                         with self._msg_lock:
                             tm = self._msg_tracked.get(msg_id)
@@ -1164,13 +1267,22 @@ class APRSLiteApp(App):
                 if tm is None or tm.state != MsgState.PENDING:
                     return
                 tm.attempts += 1
-                addressee, text = tm.addressee, tm.text
+                addressee, text, row_id = tm.addressee, tm.text, tm.row_id
 
-            info = encode_aprs_message(addressee, text, msg_id)
-            ok, err = send_aprs_is(info)
+            ok, err, via = _send_msg_rf_is(callsign, passcode, server, addressee, text, msg_id)
+            if ok and attempt == 0:
+                # Première envoi réussi : mettre à jour le via dans la DB
+                _chat_set_status(row_id, "pending")
+                try:
+                    with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+                        conn.execute("UPDATE chat_messages SET via=? WHERE id=?", (via, row_id))
+                except Exception:
+                    pass
             self._msg_dirty = True
 
-            status = f"[dim]#{msg_id} → {addressee} : {'envoyé' if ok else 'erreur: ' + err} (essai {attempt+1}/{len(_MSG_RETRY_DELAYS)})[/]"
+            label = "RF" if via == "rf" else "IS"
+            status = (f"[dim]#{msg_id} → {addressee} : {'envoyé ' + label if ok else 'erreur: ' + err}"
+                      f" (essai {attempt+1}/{len(_MSG_RETRY_DELAYS)})[/]")
             try:
                 self.call_from_thread(
                     self.query_one("#messages_panel", MessagesPanel).set_send_status, status)
@@ -1182,6 +1294,7 @@ class APRSLiteApp(App):
                 tm = self._msg_tracked.get(msg_id)
                 if tm and tm.state == MsgState.PENDING:
                     tm.state = MsgState.FAILED
+                    _chat_set_status(tm.row_id, "failed")
         self._msg_dirty = True
 
     def on_button_pressed(self, event):
