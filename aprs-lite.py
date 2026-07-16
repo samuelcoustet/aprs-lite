@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aprs-lite.py v1.0.10
+aprs-lite.py v1.0.11
 """
 import re, subprocess, socket, time, math, sys as _sys, threading, sqlite3
 from enum import Enum
@@ -230,6 +230,13 @@ def _chat_set_status(row_id: int, status: str):
     except Exception:
         pass
 
+@dataclass
+class _FakeMsg:
+    """Remplace un APRSPacket pour les messages inbound chargés depuis la DB."""
+    source: str
+    addressee: str
+    message_text: str
+
 def _telemetry_insert(bme_data: dict, box_data: dict | None = None):
     """Insère une ligne de telemetry dans sidecar.db (capteur + système)."""
     if not SIDECAR_DB.exists():
@@ -344,7 +351,7 @@ _DW_PKT_RE = re.compile(
 _sys.path.insert(0, "/opt/aprs-lite")
 try:
     from aprs_decoder  import decode_packet
-    from station_tracker import StationTracker, bearing_cardinal, time_ago
+    from station_tracker import StationTracker, StationRecord, bearing_cardinal, time_ago
     from dedup_filter  import DeduplicationFilter
     _APRS_OK = True
 except ImportError:
@@ -1000,7 +1007,7 @@ class APRSLiteApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = "APRS-AIOC-RELAY-LITE v1.0.10"
+        self.title = "APRS-AIOC-RELAY-LITE v1.0.11"
         self._aprs_messages = []
         self._msg_tracked   = {}
         self._msg_next_id   = 1
@@ -1008,6 +1015,12 @@ class APRSLiteApp(App):
         self._init_stations()
         self._poll_status(); self._follow_journal(); self._run_aioc_detect(); self._sensor_worker()
         self.set_interval(10, self._refresh_panels)
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep interruptible : se réveille toutes les 0.2 s pour vérifier _stopping."""
+        deadline = time.monotonic() + seconds
+        while not self._stopping and time.monotonic() < deadline:
+            time.sleep(0.2)
 
     def _init_stations(self) -> None:
         if not _APRS_OK:
@@ -1020,6 +1033,99 @@ class APRSLiteApp(App):
             self._dedup           = DeduplicationFilter(window=30.0)
             self._own_lat         = lat
             self._own_lon         = lon
+        except Exception:
+            pass
+        self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        """Charge stations et messages depuis sidecar.db au démarrage."""
+        if not SIDECAR_DB.exists():
+            return
+        now_mono = time.monotonic()
+        now_utc  = datetime.now(_tz.utc)
+        try:
+            with sqlite3.connect(str(SIDECAR_DB), timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+
+                # ── Stations ──────────────────────────────────────────────
+                if self._station_tracker is not None and _APRS_OK:
+                    rows = conn.execute(
+                        "SELECT * FROM stations WHERE last_lat IS NOT NULL ORDER BY last_seen DESC LIMIT 200"
+                    ).fetchall()
+                    for r in rows:
+                        d = dict(r)
+                        cs = (d.get("callsign") or "").upper()
+                        if not cs:
+                            continue
+                        try:
+                            age = max(0.0, (now_utc - datetime.fromisoformat(d["last_seen"])).total_seconds())
+                        except Exception:
+                            age = 86400.0
+                        # Injecter directement dans le dict interne
+                        sym = d.get("last_symbol") or ""
+                        rec = StationRecord(
+                            callsign      = cs,
+                            last_heard    = now_mono - age,
+                            latitude      = d.get("last_lat"),
+                            longitude     = d.get("last_lon"),
+                            symbol_table  = sym[0] if len(sym) > 1 else "/",
+                            symbol_code   = sym[-1] if sym else ">",
+                            comment       = d.get("last_comment") or "",
+                            packet_count  = d.get("frame_count") or 1,
+                            last_info_type= d.get("last_data_type") or "position",
+                        )
+                        self._station_tracker._update_dist(rec)
+                        self._station_tracker._stations[cs] = rec
+                    self._stations_dirty = True
+
+                # ── Messages inbound ──────────────────────────────────────
+                in_rows = conn.execute(
+                    "SELECT * FROM chat_messages WHERE direction='in' ORDER BY id DESC LIMIT 50"
+                ).fetchall()
+                for r in reversed(in_rows):
+                    d = dict(r)
+                    try:
+                        age = max(0.0, (now_utc - datetime.fromisoformat(d["timestamp"])).total_seconds())
+                    except Exception:
+                        age = 3600.0
+                    mono = now_mono - age
+                    fake = _FakeMsg(
+                        source       = d.get("src") or "?",
+                        addressee    = d.get("dst") or "?",
+                        message_text = d.get("text") or "",
+                    )
+                    self._aprs_messages.append((mono, fake))
+                if in_rows:
+                    self._messages_dirty = True
+
+                # ── Messages outbound (affichage historique) ───────────────
+                out_rows = conn.execute(
+                    "SELECT * FROM chat_messages WHERE direction='out' ORDER BY id DESC LIMIT 30"
+                ).fetchall()
+                status_map = {"acked": MsgState.ACKED, "failed": MsgState.FAILED,
+                              "rejected": MsgState.REJECTED}
+                for r in out_rows:
+                    d = dict(r)
+                    mid = d.get("msg_no") or str(self._msg_next_id)
+                    if mid in self._msg_tracked:
+                        continue
+                    try:
+                        age = max(0.0, (now_utc - datetime.fromisoformat(d["timestamp"])).total_seconds())
+                    except Exception:
+                        age = 3600.0
+                    state = status_map.get(d.get("status") or "", MsgState.PENDING)
+                    tm = TrackedMsg(
+                        msg_id    = mid,
+                        addressee = d.get("dst") or "?",
+                        text      = d.get("text") or "",
+                        state     = state,
+                        attempts  = 1,
+                        created   = now_mono - age,
+                        row_id    = d.get("id") or 0,
+                    )
+                    self._msg_tracked[mid] = tm
+                if out_rows:
+                    self._msg_dirty = True
         except Exception:
             pass
 
@@ -1068,7 +1174,7 @@ class APRSLiteApp(App):
                 s=get_system_stats()
                 self.call_from_thread(sp.set_sys_stats, s["cpu_temp"], s["ram_pct"], s["sd_pct"])
             except: pass
-            time.sleep(15)
+            self._sleep(15)
 
     @work(exclusive=True, thread=True)
     def _follow_journal(self):
@@ -1164,9 +1270,10 @@ class APRSLiteApp(App):
                             self._log_lines+=1
                             if self._log_lines>LOG_MAX_LINES: self.call_from_thread(log.clear); self._log_lines=0
                         except: pass
-                proc.wait()
+                try: proc.wait(timeout=3)
+                except subprocess.TimeoutExpired: proc.kill()
             except: pass
-            if not self._stopping: time.sleep(3)
+            if not self._stopping: self._sleep(3)
 
     @work(exclusive=True, thread=True)
     def _run_aioc_detect(self):
@@ -1181,7 +1288,7 @@ class APRSLiteApp(App):
                     subprocess.run(["sudo","systemctl","restart","aprs-direwolf"],timeout=15)
                 self._aioc_was_ok=ok
             except: pass
-            time.sleep(30)
+            self._sleep(30)
 
     @work(exclusive=True, thread=True)
     def _sensor_worker(self):
@@ -1193,7 +1300,7 @@ class APRSLiteApp(App):
                 if not self._stopping:
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_error,"Capteur désactivé — activer dans l'onglet Config")
                     except: pass
-                time.sleep(30); continue
+                self._sleep(30); continue
             try: interval = max(5, min(60, int(cfg.get("SENSOR_INTERVAL","10")))) * 60
             except: interval = 600
             addr_cfg = cfg.get("SENSOR_I2C_ADDR","auto")
@@ -1232,7 +1339,7 @@ class APRSLiteApp(App):
                 except Exception as e:
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_error, str(e))
                     except: pass
-                    time.sleep(60); continue
+                    self._sleep(60); continue
             # Lecture capteur boîtier (0x77) pour telemetry DB
             box_data = None
             try:
@@ -1272,14 +1379,14 @@ class APRSLiteApp(App):
                 if not self._stopping:
                     try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[red]Capteur: {e}[/]")
                     except: pass
-                time.sleep(30); continue
+                self._sleep(30); continue
             next_t = time.time() + interval
             self._next_beacon_ts = next_t
             while not self._stopping and time.time() < next_t:
                 remaining = max(0, int(next_t - time.time()))
                 try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_countdown, remaining)
                 except: pass
-                time.sleep(min(30, max(1, remaining)))
+                self._sleep(min(5, max(1, remaining)))
 
     def _wx_send_from_thread(self, data: dict):
         try:
@@ -1452,6 +1559,8 @@ class APRSLiteApp(App):
         self._stopping = True
         if self._journal_proc:
             try: self._journal_proc.terminate()
+            except: pass
+            try: self._journal_proc.stdout.close()   # débloque le for-line
             except: pass
         if self._sensor_obj:
             try: self._sensor_obj.close()
