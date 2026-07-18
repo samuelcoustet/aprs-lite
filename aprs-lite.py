@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-aprs-lite.py v1.0.11
+aprs-lite.py v1.0.12
 """
-import re, subprocess, socket, time, math, sys as _sys, threading, sqlite3
+import re, subprocess, socket, time, math, sys as _sys, threading, sqlite3, os, signal
 from enum import Enum
 from dataclasses import dataclass, field as _field
 from pathlib import Path
@@ -17,9 +17,51 @@ from textual import work
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
 SIDECAR_DB    = Path("/home/pi/aprs-sidecar-dashboard/data/sidecar.db")
+PID_FILE      = Path("/tmp/aprs-lite.pid")
 LOG_MAX_LINES = 500
 _MSG_MAX      = 100
 _OUT_MAX      = 30
+
+def _ensure_single_instance() -> None:
+    """Termine toute instance précédente d'aprs-lite.py avant de démarrer."""
+    my_pid = os.getpid()
+    try:
+        if PID_FILE.exists():
+            old_pid_str = PID_FILE.read_text().strip()
+            if old_pid_str.isdigit():
+                old_pid = int(old_pid_str)
+                if old_pid != my_pid:
+                    cmdline_path = Path(f"/proc/{old_pid}/cmdline")
+                    if cmdline_path.exists():
+                        try:
+                            cmdline = cmdline_path.read_bytes().decode(errors="replace")
+                        except Exception:
+                            cmdline = ""
+                        if "aprs-lite.py" in cmdline:
+                            try:
+                                # Termine tout le groupe de processus (inclut journalctl/kissutil enfants)
+                                try:
+                                    pgid = os.getpgid(old_pid)
+                                    os.killpg(pgid, signal.SIGTERM)
+                                except (ProcessLookupError, PermissionError):
+                                    os.kill(old_pid, signal.SIGTERM)
+                                for _ in range(30):
+                                    time.sleep(0.1)
+                                    if not Path(f"/proc/{old_pid}").exists():
+                                        break
+                                else:
+                                    try:
+                                        os.killpg(os.getpgid(old_pid), signal.SIGKILL)
+                                    except (ProcessLookupError, PermissionError):
+                                        os.kill(old_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+    except Exception:
+        pass
+    try:
+        PID_FILE.write_text(str(my_pid))
+    except Exception:
+        pass
 
 # Délais entre tentatives (secondes) : immédiat, 30s, 60s, 120s, 120s
 _MSG_RETRY_DELAYS = [0, 30, 60, 120, 120]
@@ -1007,7 +1049,7 @@ class APRSLiteApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = "APRS-AIOC-RELAY-LITE v1.0.11"
+        self.title = "APRS-AIOC-RELAY-LITE v1.0.12"
         self._aprs_messages = []
         self._msg_tracked   = {}
         self._msg_next_id   = 1
@@ -1584,4 +1626,5 @@ class APRSLiteApp(App):
         self.exit()
 
 if __name__ == "__main__":
+    _ensure_single_instance()
     APRSLiteApp().run()
