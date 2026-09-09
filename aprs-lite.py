@@ -72,14 +72,14 @@ def _fetch_openmeteo_wx(lat: float, lon: float) -> dict | None:
 
 def make_position_packet(callsign: str, lat: float, lon: float,
                           comment: str = "", altitude_m: float = 0) -> str:
-    """Position beacon with digi star symbol (/#)."""
+    """Position beacon with repeater symbol (alternate table \\r)."""
     ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
     od, om = int(abs(lon)), (abs(lon) % 1) * 60
     ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
     os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
     alt_ft = int(altitude_m * 3.28084) if altitude_m else 0
     suffix = f"/A={alt_ft:06d} {comment}" if alt_ft else f" {comment}"
-    return f"{callsign}>APDW17,WIDE1-1:!{ls}/{os_}#PHG3050{suffix}"
+    return f"{callsign}>APDW17,WIDE1-1:!{ls}\\{os_}rPHG3050{suffix}"
 
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
@@ -476,10 +476,9 @@ except ImportError:
     def draw_geo(canvas, *a): pass
 
 
-def make_wx_object(callsign, lat, lon, data):
-    """APRS weather object — appears as separate WX station on aprs.fi."""
-    obj_name = f"{callsign}-WX".ljust(9)[:9]
-    ts = time.strftime("%d%H%Mz", time.gmtime())
+def make_wx_packet(callsign, lat, lon, data):
+    """Weather position packet from CALLSIGN-13 with symbol /_ (weather station)."""
+    cs13 = callsign.split("-")[0] + "-13"
     ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
     od, om = int(abs(lon)), (abs(lon) % 1) * 60
     ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
@@ -497,7 +496,7 @@ def make_wx_object(callsign, lat, lon, data):
         extras.append(f"VOC={data['voc_eq']:.2f}ppm")
     if extras:     wx += " " + " ".join(extras)
     elif data.get("gas"): wx += f" Gas:{data['gas']}ohm"
-    return f"{callsign}>APDW17:;{obj_name}*{ts}{ls}/{os_}_{wx}"
+    return f"{cs13}>APDW17:!{ls}/{os_}_{wx}"
 
 def make_packet():
     cfg = load_config()
@@ -507,7 +506,7 @@ def make_packet():
         try: alt_m = float(cfg.get("ALTITUDE_M","0"))
         except: alt_m = 0
         return make_position_packet(callsign, lat, lon, comment, alt_m)
-    except: return f"{callsign}>APDW17,WIDE1-1:!4258.70N/00044.96W#PHG3050 {comment}"
+    except: return f"{callsign}>APDW17,WIDE1-1:!4258.71N\\00044.96WrPHG3050 {comment}"
 
 _SYMBOL_LABELS = {
     ">": "Mobile",  "-": "QTH",     "#": "Digipeat", "_": "Météo",
@@ -1555,7 +1554,7 @@ class APRSLiteApp(App):
             cfg    = load_config(); cs = cfg.get("CALLSIGN","F5ZVO")
             lat    = float(cfg.get("WX_LAT", cfg.get("LAT","42.9783")))
             lon    = float(cfg.get("WX_LON", cfg.get("LON","-0.7493")))
-            packet = make_wx_object(cs, lat, lon, data)
+            packet = make_wx_packet(cs, lat, lon, data)
             self._dispatch_beacon(packet, "WX", cs, cfg)
         except: pass
 
