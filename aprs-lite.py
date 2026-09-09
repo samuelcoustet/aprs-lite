@@ -1531,10 +1531,17 @@ class APRSLiteApp(App):
                     self._wx_send_from_thread(self._sensor_data)
                 else:
                     try:
-                        _lat = float(cfg.get("LAT","0")); _lon = float(cfg.get("LON","0"))
+                        _lat = float(cfg.get("WX_LAT", cfg.get("LAT","0")))
+                        _lon = float(cfg.get("WX_LON", cfg.get("LON","0")))
                         _om = _fetch_openmeteo_wx(_lat, _lon) if _internet_ok() else None
-                        if _om: self._wx_send_from_thread(_om)
-                    except Exception: pass
+                        if _om:
+                            self._wx_send_from_thread(_om)
+                        else:
+                            try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, "[dim]WX: pas de données capteur ni Open-Meteo[/]")
+                            except: pass
+                    except Exception as e:
+                        try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[red]WX fallback error: {e}[/]")
+                        except: pass
             next_pos = time.time() + (BEACON_INTERVAL - WX_OFFSET)
             self._next_beacon_ts = next_pos
             while not self._stopping and time.time() < next_pos:
