@@ -72,14 +72,14 @@ def _fetch_openmeteo_wx(lat: float, lon: float) -> dict | None:
 
 def make_position_packet(callsign: str, lat: float, lon: float,
                           comment: str = "", altitude_m: float = 0) -> str:
-    """Position-only beacon (digi symbol #, overlay R) — fallback when no WX data."""
+    """Position beacon with repeater tower symbol (alternate table \\r)."""
     ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
     od, om = int(abs(lon)), (abs(lon) % 1) * 60
     ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
     os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
     alt_ft = int(altitude_m * 3.28084) if altitude_m else 0
-    suffix = f"/A={alt_ft:06d}{comment}" if alt_ft else comment
-    return f"{callsign}>APDW17:!{ls}/{os_}rPHG3050{suffix}"
+    suffix = f"/A={alt_ft:06d} {comment}" if alt_ft else f" {comment}"
+    return f"{callsign}>APDW17,WIDE1-1:!{ls}\\{os_}rPHG3050{suffix}"
 
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
@@ -476,14 +476,16 @@ except ImportError:
     def draw_geo(canvas, *a): pass
 
 
-def make_weather_packet(callsign, lat, lon, data):
+def make_wx_object(callsign, lat, lon, data):
+    """APRS weather object — appears as separate WX station on aprs.fi."""
+    obj_name = f"{callsign}-WX".ljust(9)[:9]
+    ts = time.strftime("%d%H%Mz", time.gmtime())
     ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
     od, om = int(abs(lon)), (abs(lon) % 1) * 60
     ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
     os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
     tf  = round(data["temperature"] * 9 / 5 + 32)
     hh  = int(data["humidity"]) % 100
-    _alt = _get_altitude_from_cfg()  # (déjà normalisée après sensor.read)
     bp  = min(99999, round(data["pressure"] * 10))
     wx  = f".../...g...t{tf:03d}r...p...P...h{hh:02d}b{bp:05d}"
     extras = []
@@ -495,22 +497,17 @@ def make_weather_packet(callsign, lat, lon, data):
         extras.append(f"VOC={data['voc_eq']:.2f}ppm")
     if extras:     wx += " " + " ".join(extras)
     elif data.get("gas"): wx += f" Gas:{data['gas']}ohm"
-    # Match position beacon format: APDW17, no path, altitude + comment
-    _cfg2 = load_config()
-    _cm = _cfg2.get("COMMENT", "Relais APRS")
-    _alt_ft = int(_alt * 3.28084) if _alt else 0
-    _suffix = f"/A={_alt_ft:06d}{_cm}" if _alt_ft else _cm
-    return f"{callsign}>APDW17:!{ls}/{os_}r{wx}{_suffix}"
+    return f"{callsign}>APDW17:;{obj_name}*{ts}{ls}/{os_}_{wx}"
 
 def make_packet():
     cfg = load_config()
     callsign = cfg.get("CALLSIGN","F5ZVO"); comment = cfg.get("COMMENT","Relais APRS")
     try:
         lat=float(cfg.get("LAT","42.9783")); lon=float(cfg.get("LON","-0.7493"))
-        ld,lm=int(abs(lat)),(abs(lat)%1)*60; od,om=int(abs(lon)),(abs(lon)%1)*60
-        ls=f"{ld:02d}{lm:05.2f}{'N' if lat>=0 else 'S'}"; os_=f"{od:03d}{om:05.2f}{'E' if lon>=0 else 'W'}"
-        return f"{callsign}>APNW01,WIDE1-1:!{ls}/{os_}# {comment}"
-    except: return f"{callsign}>APNW01,WIDE1-1:!4258.70N/00044.96W# {comment}"
+        try: alt_m = float(cfg.get("ALTITUDE_M","0"))
+        except: alt_m = 0
+        return make_position_packet(callsign, lat, lon, comment, alt_m)
+    except: return f"{callsign}>APDW17,WIDE1-1:!4258.70N\\00044.96WrPHG3050 {comment}"
 
 _SYMBOL_LABELS = {
     ">": "Mobile",  "-": "QTH",     "#": "Digipeat", "_": "Météo",
@@ -1138,7 +1135,7 @@ class APRSLiteApp(App):
         self._msg_next_id   = 1
         self._msg_lock      = threading.Lock()
         self._init_stations()
-        self._poll_status(); self._follow_journal(); self._run_aioc_detect(); self._sensor_worker()
+        self._poll_status(); self._follow_journal(); self._run_aioc_detect(); self._sensor_worker(); self._beacon_worker()
         self.set_interval(10, self._refresh_panels)
 
     def _sleep(self, seconds: float) -> None:
@@ -1495,12 +1492,9 @@ class APRSLiteApp(App):
                     ts = time.strftime("%H:%M:%S")
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).update_sensor, data, chip, ts)
                     except: pass
-                    # Stocker telemetry dans la DB partagée
                     threading.Thread(
                         target=_telemetry_insert, args=(data, box_data), daemon=True
                     ).start()
-                    if cfg.get("SENSOR_TX_APRS","1") == "1":
-                        self._wx_send_from_thread(data)
                 elif "BSEC" in chip and not self._stopping:
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_chip_status,
                         f"[bold yellow]{chip}[/]  [dim]— initialisation (~5 min pour 1re mesure)[/]")
@@ -1508,30 +1502,43 @@ class APRSLiteApp(App):
             except Exception as e:
                 sensor = None
                 if not self._stopping:
-                    try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[yellow]BME KO ({e}), fallback Open-Meteo/position[/]")
+                    try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[yellow]BME KO ({e}), retry dans 60s[/]")
                     except: pass
-                # Fallback cascade : Open-Meteo, puis position-only
-                if cfg.get("SENSOR_TX_APRS","1") == "1":
+                self._sleep(60); continue
+            self._sleep(min(interval, 60))
+
+    @work(exclusive=True, thread=True)
+    def _beacon_worker(self):
+        """Beacon loop: position every 30 min, WX object 5 min later."""
+        BEACON_INTERVAL = 1800  # 30 min
+        WX_OFFSET = 300         # 5 min after position
+        self._sleep(10)  # attendre démarrage direwolf
+        while not self._stopping:
+            # --- Position beacon (repeater tower) ---
+            self._pos_send_from_thread()
+            next_wx = time.time() + WX_OFFSET
+            self._next_beacon_ts = next_wx
+            while not self._stopping and time.time() < next_wx:
+                remaining = max(0, int(next_wx - time.time()))
+                try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_countdown, remaining)
+                except: pass
+                self._sleep(min(5, max(1, remaining)))
+            if self._stopping: break
+            # --- WX object (F5ZVO-WX) ---
+            cfg = load_config()
+            if cfg.get("SENSOR_TX_APRS","1") == "1":
+                if self._sensor_data:
+                    self._wx_send_from_thread(self._sensor_data)
+                else:
                     try:
                         _lat = float(cfg.get("LAT","0")); _lon = float(cfg.get("LON","0"))
                         _om = _fetch_openmeteo_wx(_lat, _lon) if _internet_ok() else None
-                        if _om:
-                            self._wx_send_from_thread(_om)
-                        else:
-                            self._pos_send_from_thread()
+                        if _om: self._wx_send_from_thread(_om)
                     except Exception: pass
-                next_t = time.time() + interval
-                self._next_beacon_ts = next_t
-                while not self._stopping and time.time() < next_t:
-                    remaining = max(0, int(next_t - time.time()))
-                    try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_countdown, remaining)
-                    except: pass
-                    self._sleep(min(5, max(1, remaining)))
-                continue
-            next_t = time.time() + interval
-            self._next_beacon_ts = next_t
-            while not self._stopping and time.time() < next_t:
-                remaining = max(0, int(next_t - time.time()))
+            next_pos = time.time() + (BEACON_INTERVAL - WX_OFFSET)
+            self._next_beacon_ts = next_pos
+            while not self._stopping and time.time() < next_pos:
+                remaining = max(0, int(next_pos - time.time()))
                 try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_countdown, remaining)
                 except: pass
                 self._sleep(min(5, max(1, remaining)))
@@ -1539,8 +1546,9 @@ class APRSLiteApp(App):
     def _wx_send_from_thread(self, data: dict):
         try:
             cfg    = load_config(); cs = cfg.get("CALLSIGN","F5ZVO")
-            lat    = float(cfg.get("LAT","43.3180833")); lon = float(cfg.get("LON","-0.3315"))
-            packet = make_weather_packet(cs, lat, lon, data)
+            lat    = float(cfg.get("WX_LAT", cfg.get("LAT","42.9783")))
+            lon    = float(cfg.get("WX_LON", cfg.get("LON","-0.7493")))
+            packet = make_wx_object(cs, lat, lon, data)
             self._dispatch_beacon(packet, "WX", cs, cfg)
         except: pass
 
