@@ -14,6 +14,73 @@ from textual.widgets import (Header, Footer, Static, Button, Label, Input, Log,
 from textual.binding import Binding
 from textual import work
 
+def _get_altitude_from_cfg():
+    """Read ALTITUDE_M from /opt/aprs-lite/config.env."""
+    try:
+        with open("/opt/aprs-lite/config.env") as f:
+            for ln in f:
+                if ln.startswith("ALTITUDE_M"):
+                    return float(ln.split("=",1)[1].strip().strip('"').strip("'"))
+    except Exception: pass
+    return 0.0
+
+def _sea_level_pressure(p_hpa, alt_m, t_c):
+    """Station pressure (hPa) → sea-level (ISA barometric)."""
+    if p_hpa is None or not alt_m: return p_hpa
+    try:
+        t = float(t_c) if t_c is not None else 15.0
+        a = float(alt_m)
+        return round(p_hpa * (1 - (0.0065 * a) / (t + 0.0065 * a + 273.15)) ** -5.257, 1)
+    except Exception:
+        return p_hpa
+
+
+
+def _internet_ok(timeout: float = 3.0) -> bool:
+    """Ping APRS-IS to detect internet availability."""
+    try:
+        with socket.create_connection(("euro.aprs2.net", 14580), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def _fetch_openmeteo_wx(lat: float, lon: float) -> dict | None:
+    """Fetch weather from Open-Meteo. Returns dict or None on failure."""
+    import urllib.request, json as _json
+    try:
+        url = (f"https://api.open-meteo.com/v1/forecast?"
+               f"latitude={lat}&longitude={lon}"
+               f"&current=temperature_2m,relative_humidity_2m,pressure_msl,"
+               f"wind_speed_10m,wind_direction_10m,precipitation"
+               f"&wind_speed_unit=kn&timezone=UTC")
+        r = urllib.request.urlopen(url, timeout=8)
+        d = _json.loads(r.read())
+        c = d.get("current", {})
+        if c.get("temperature_2m") is None or c.get("pressure_msl") is None:
+            return None
+        return {
+            "temperature":    c.get("temperature_2m"),
+            "humidity":       c.get("relative_humidity_2m") or 0,
+            "pressure":       c.get("pressure_msl"),
+            "wind_speed":     c.get("wind_speed_10m"),
+            "wind_dir":       c.get("wind_direction_10m"),
+            "rain_1h":        c.get("precipitation") or 0,
+            "weather_source": "open-meteo",
+        }
+    except Exception:
+        return None
+
+def make_position_packet(callsign: str, lat: float, lon: float,
+                          comment: str = "", altitude_m: float = 0) -> str:
+    """Position-only beacon (digi symbol #, overlay R) — fallback when no WX data."""
+    ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
+    od, om = int(abs(lon)), (abs(lon) % 1) * 60
+    ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
+    os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
+    alt_ft = int(altitude_m * 3.28084) if altitude_m else 0
+    suffix = f"/A={alt_ft:06d}{comment}" if alt_ft else comment
+    return f"{callsign}>APDW17:!{ls}/{os_}rPHG3050{suffix}"
+
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
 SIDECAR_DB    = Path("/home/pi/aprs-sidecar-dashboard/data/sidecar.db")
@@ -382,7 +449,7 @@ def get_system_stats():
     return stats
 
 ANSI_RE    = re.compile(r'\x1b\[[0-9;]*m')
-RF_RE      = re.compile(r'^\[0[L]?\]\s+(.+)$')
+RF_RE      = re.compile(r'^\[0(?:\.\d+|L)?\]\s+(.+)$')
 _DW_PKT_RE = re.compile(
     r'(?:Digipeating\s+)?'
     r'\[\d+(?:\.\d+[^\]]*?)?\]\s+'
@@ -416,8 +483,9 @@ def make_weather_packet(callsign, lat, lon, data):
     os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
     tf  = round(data["temperature"] * 9 / 5 + 32)
     hh  = int(data["humidity"]) % 100
+    _alt = _get_altitude_from_cfg()  # (déjà normalisée après sensor.read)
     bp  = min(99999, round(data["pressure"] * 10))
-    wx  = f"c...s...g...t{tf:03d}h{hh:02d}b{bp:05d}"
+    wx  = f".../...g...t{tf:03d}r...p...P...h{hh:02d}b{bp:05d}"
     extras = []
     if data.get("iaq", -1) >= 0:
         extras.append(f"IAQ={data['iaq']:.0f}/{data.get('iaq_accuracy',0)}")
@@ -427,7 +495,12 @@ def make_weather_packet(callsign, lat, lon, data):
         extras.append(f"VOC={data['voc_eq']:.2f}ppm")
     if extras:     wx += " " + " ".join(extras)
     elif data.get("gas"): wx += f" Gas:{data['gas']}ohm"
-    return f"{callsign}>APNW01,WIDE1-1:!{ls}/{os_}_{wx}"
+    # Match position beacon format: APDW17, no path, altitude + comment
+    _cfg2 = load_config()
+    _cm = _cfg2.get("COMMENT", "Relais APRS")
+    _alt_ft = int(_alt * 3.28084) if _alt else 0
+    _suffix = f"/A={_alt_ft:06d}{_cm}" if _alt_ft else _cm
+    return f"{callsign}>APDW17:!{ls}/{os_}r{wx}{_suffix}"
 
 def make_packet():
     cfg = load_config()
@@ -492,6 +565,16 @@ class StatusPanel(Static):
             self.app.query_one("#stats_panel", Static).update(
                 f"RF-RX : {self._rf_rx}\nRF-TX : {self._rf_tx}\nIS-RX : {self._is_rx}\nBeacons : {self._beacons}"
             )
+        except Exception:
+            pass
+        try:
+            import json, os, tempfile
+            data = {"rf_rx": self._rf_rx, "rf_tx": self._rf_tx,
+                    "is_rx": self._is_rx, "beacons": self._beacons}
+            target = "/opt/aprs-lite/logs/stats.json"
+            fd, tmp = tempfile.mkstemp(dir="/opt/aprs-lite/logs", prefix=".stats_", suffix=".json"); os.chmod(tmp, 0o644)
+            with os.fdopen(fd, "w") as f: json.dump(data, f)
+            os.replace(tmp, target)
         except Exception:
             pass
 
@@ -1069,8 +1152,8 @@ class APRSLiteApp(App):
             return
         try:
             cfg = load_config()
-            lat = float(cfg.get("LAT", "48.8566"))
-            lon = float(cfg.get("LON", "2.3522"))
+            lat = float(cfg.get("LAT", "43.3180833"))
+            lon = float(cfg.get("LON", "-0.3315"))
             self._station_tracker = StationTracker(own_lat=lat, own_lon=lon)
             self._dedup           = DeduplicationFilter(window=30.0)
             self._own_lat         = lat
@@ -1238,7 +1321,7 @@ class APRSLiteApp(App):
                         if RF_RE.match(clean):
                             if '[0L]' in line: self.call_from_thread(sp.inc_rf_tx)
                             else: self.call_from_thread(sp.inc_rf_rx)
-                        elif re.match(r'^\[ig\]',clean): self.call_from_thread(sp.inc_is_rx)
+                        elif re.match(r'^\[ig(?:>\S*)?\]',clean): self.call_from_thread(sp.inc_is_rx)
                         if re.search(r'PBEACON|beacon',clean,re.IGNORECASE): self.call_from_thread(sp.inc_beacon)
                         m=RF_RE.match(clean)
                         if m: self._last_frame=m.group(1)[:65]; self.call_from_thread(sp.set_last_frame,self._last_frame)
@@ -1402,6 +1485,12 @@ class APRSLiteApp(App):
             try:
                 data = sensor.read()
                 if data is not None:
+                    try:
+                        _alt = _get_altitude_from_cfg()
+                        if data.get("pressure") and _alt:
+                            data["pressure_raw"] = data["pressure"]
+                            data["pressure"] = _sea_level_pressure(data["pressure"], _alt, data.get("temperature"))
+                    except Exception: pass
                     self._sensor_data = data
                     ts = time.strftime("%H:%M:%S")
                     try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).update_sensor, data, chip, ts)
@@ -1419,9 +1508,26 @@ class APRSLiteApp(App):
             except Exception as e:
                 sensor = None
                 if not self._stopping:
-                    try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[red]Capteur: {e}[/]")
+                    try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"[yellow]BME KO ({e}), fallback Open-Meteo/position[/]")
                     except: pass
-                self._sleep(30); continue
+                # Fallback cascade : Open-Meteo, puis position-only
+                if cfg.get("SENSOR_TX_APRS","1") == "1":
+                    try:
+                        _lat = float(cfg.get("LAT","0")); _lon = float(cfg.get("LON","0"))
+                        _om = _fetch_openmeteo_wx(_lat, _lon) if _internet_ok() else None
+                        if _om:
+                            self._wx_send_from_thread(_om)
+                        else:
+                            self._pos_send_from_thread()
+                    except Exception: pass
+                next_t = time.time() + interval
+                self._next_beacon_ts = next_t
+                while not self._stopping and time.time() < next_t:
+                    remaining = max(0, int(next_t - time.time()))
+                    try: self.call_from_thread(self.query_one("#meteo_panel",MeteoPanel).set_countdown, remaining)
+                    except: pass
+                    self._sleep(min(5, max(1, remaining)))
+                continue
             next_t = time.time() + interval
             self._next_beacon_ts = next_t
             while not self._stopping and time.time() < next_t:
@@ -1432,18 +1538,50 @@ class APRSLiteApp(App):
 
     def _wx_send_from_thread(self, data: dict):
         try:
-            cfg    = load_config(); cs = cfg.get("CALLSIGN","F0CALL")
-            lat    = float(cfg.get("LAT","48.8566")); lon = float(cfg.get("LON","2.3522"))
+            cfg    = load_config(); cs = cfg.get("CALLSIGN","F5ZVO")
+            lat    = float(cfg.get("LAT","43.3180833")); lon = float(cfg.get("LON","-0.3315"))
             packet = make_weather_packet(cs, lat, lon, data)
-            ok, err = send_beacon(packet); ts = time.strftime("%H:%M:%S")
-            try: self.call_from_thread(self.query_one("#log_panel",Log).write_line,
-                f"[bold yellow]WX RF: {packet}[/]" if ok else f"[red]WX beacon: {err}[/]")
-            except: pass
-            try:
-                mp = self.query_one("#meteo_panel",MeteoPanel)
-                self.call_from_thread(mp.set_last_packet, packet, ok, ts)
-                self.call_from_thread(mp.set_tx_status, "[green]Beacon envoyé[/]" if ok else f"[red]{err}[/]")
-            except: pass
+            self._dispatch_beacon(packet, "WX", cs, cfg)
+        except: pass
+
+    def _pos_send_from_thread(self):
+        """Fallback position-only quand pas de données météo."""
+        try:
+            cfg = load_config(); cs = cfg.get("CALLSIGN","F5ZVO")
+            lat = float(cfg.get("LAT","43.3180833")); lon = float(cfg.get("LON","-0.3315"))
+            comment = cfg.get("COMMENT","Relais APRS")
+            try: alt_m = float(cfg.get("ALTITUDE_M","0"))
+            except: alt_m = 0
+            packet = make_position_packet(cs, lat, lon, comment, alt_m)
+            self._dispatch_beacon(packet, "POS", cs, cfg)
+        except: pass
+
+    def _dispatch_beacon(self, packet: str, kind: str, cs: str, cfg: dict):
+        """Envoi dual : KISS (RF via direwolf) + APRS-IS TCP (si internet)."""
+        ts = time.strftime("%H:%M:%S")
+        # 1. RF via KISS/direwolf
+        ok_rf, err_rf = send_beacon(packet)
+        rf_msg = (f"[bold yellow]{kind} RF: {packet}[/]" if ok_rf
+                  else f"[red]{kind} RF: {err_rf}[/]")
+        # 2. APRS-IS TCP si internet disponible
+        ok_is = False; err_is = ""
+        if _internet_ok():
+            passcode = cfg.get("PASSCODE","0").strip()
+            server   = _aprs_is_server()
+            ok_is, err_is = _send_packet_is(packet, cs, passcode, server)
+            is_msg = f"[bold cyan]{kind} IS: OK[/]" if ok_is else f"[red]{kind} IS: {err_is}[/]"
+        else:
+            is_msg = f"[dim]{kind} IS: no-internet[/]"
+        try: self.call_from_thread(self.query_one("#log_panel",Log).write_line, f"{rf_msg}  {is_msg}")
+        except: pass
+        try:
+            mp = self.query_one("#meteo_panel",MeteoPanel)
+            self.call_from_thread(mp.set_last_packet, packet, ok_rf or ok_is, ts)
+            status = ("[green]RF+IS[/]" if (ok_rf and ok_is)
+                      else "[yellow]RF only[/]" if ok_rf
+                      else "[cyan]IS only[/]" if ok_is
+                      else f"[red]{err_rf}[/]")
+            self.call_from_thread(mp.set_tx_status, status)
         except: pass
 
     @work(thread=True)
