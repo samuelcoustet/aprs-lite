@@ -72,14 +72,14 @@ def _fetch_openmeteo_wx(lat: float, lon: float) -> dict | None:
 
 def make_position_packet(callsign: str, lat: float, lon: float,
                           comment: str = "", altitude_m: float = 0) -> str:
-    """Position beacon with repeater tower symbol (alternate table \\r)."""
+    """Position beacon with digi star symbol (/#)."""
     ld, lm = int(abs(lat)), (abs(lat) % 1) * 60
     od, om = int(abs(lon)), (abs(lon) % 1) * 60
     ls  = f"{ld:02d}{lm:05.2f}{'N' if lat >= 0 else 'S'}"
     os_ = f"{od:03d}{om:05.2f}{'E' if lon >= 0 else 'W'}"
     alt_ft = int(altitude_m * 3.28084) if altitude_m else 0
     suffix = f"/A={alt_ft:06d} {comment}" if alt_ft else f" {comment}"
-    return f"{callsign}>APDW17,WIDE1-1:!{ls}\\{os_}rPHG3050{suffix}"
+    return f"{callsign}>APDW17,WIDE1-1:!{ls}/{os_}#PHG3050{suffix}"
 
 CONFIG_PATH   = Path("/opt/aprs-lite/config.env")
 DIREWOLF_CONF = Path("/opt/aprs-lite/direwolf.conf")
@@ -507,7 +507,7 @@ def make_packet():
         try: alt_m = float(cfg.get("ALTITUDE_M","0"))
         except: alt_m = 0
         return make_position_packet(callsign, lat, lon, comment, alt_m)
-    except: return f"{callsign}>APDW17,WIDE1-1:!4258.70N\\00044.96WrPHG3050 {comment}"
+    except: return f"{callsign}>APDW17,WIDE1-1:!4258.70N/00044.96W#PHG3050 {comment}"
 
 _SYMBOL_LABELS = {
     ">": "Mobile",  "-": "QTH",     "#": "Digipeat", "_": "Météo",
